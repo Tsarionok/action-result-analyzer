@@ -19,7 +19,7 @@ namespace ActionResultAnalyzer
             "TypeSafety",
             DiagnosticSeverity.Error,
             true,
-            "ActionResult<T> methods should only return T, ActionResult, Task<T>, Task<ActionResult>, etc.");
+            "ActionResult<T> methods should only return T or ActionResult-derived types");
 
         public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics 
             => ImmutableArray.Create(Rule);
@@ -36,18 +36,33 @@ namespace ActionResultAnalyzer
         {
             var methodDeclaration = (MethodDeclarationSyntax)context.Node;
             
-            if (methodDeclaration.ReturnType is not GenericNameSyntax genericName ||
-                genericName.Identifier.Text != "ActionResult")
-            {
-                return;
-            }
-            
-            var typeArgument = genericName.TypeArgumentList.Arguments.FirstOrDefault();
-            if (typeArgument == null) return;
+            ITypeSymbol expectedTypeSymbol = null;
+            bool isAsync = false;
 
-            var expectedTypeSymbol = context.SemanticModel.GetTypeInfo(typeArgument).Type;
+            if (methodDeclaration.ReturnType is GenericNameSyntax genericName &&
+                genericName.Identifier.Text == "ActionResult")
+            {
+                var typeArgument = genericName.TypeArgumentList.Arguments.FirstOrDefault();
+                if (typeArgument == null) return;
+
+                expectedTypeSymbol = context.SemanticModel.GetTypeInfo(typeArgument).Type;
+            }
+            else if (methodDeclaration.ReturnType is GenericNameSyntax taskGenericName &&
+                     (taskGenericName.Identifier.Text == "Task" || taskGenericName.Identifier.Text == "ValueTask"))
+            {
+                if (taskGenericName.TypeArgumentList.Arguments.FirstOrDefault() is GenericNameSyntax actionResultGeneric &&
+                    actionResultGeneric.Identifier.Text == "ActionResult")
+                {
+                    var typeArgument = actionResultGeneric.TypeArgumentList.Arguments.FirstOrDefault();
+                    if (typeArgument == null) return;
+
+                    expectedTypeSymbol = context.SemanticModel.GetTypeInfo(typeArgument).Type;
+                    isAsync = true;
+                }
+            }
+
             if (expectedTypeSymbol == null) return;
-            
+
             var returnStatements = methodDeclaration.DescendantNodes()
                 .OfType<ReturnStatementSyntax>();
 
@@ -55,17 +70,59 @@ namespace ActionResultAnalyzer
             {
                 if (returnStatement.Expression == null) continue;
 
-                var returnedExpressionType = context.SemanticModel.GetTypeInfo(returnStatement.Expression).Type;
-                if (returnedExpressionType == null) continue;
-                
-                if (!IsTypeCompatible(returnedExpressionType, expectedTypeSymbol, context))
+                var expressionType = context.SemanticModel.GetTypeInfo(returnStatement.Expression).Type;
+                if (expressionType == null) continue;
+
+                if (isAsync)
                 {
-                    context.ReportDiagnostic(Diagnostic.Create(
-                        Rule,
-                        returnStatement.Expression.GetLocation(),
-                        expectedTypeSymbol.Name,
-                        returnedExpressionType.Name));
+                    AnalyzeAsyncReturnExpression(returnStatement.Expression, expectedTypeSymbol, context, returnStatement.GetLocation());
                 }
+                else
+                {
+                    AnalyzeReturnExpression(returnStatement.Expression, expectedTypeSymbol, context, returnStatement.GetLocation());
+                }
+            }
+        }
+
+        private void AnalyzeAsyncReturnExpression(ExpressionSyntax expression, ITypeSymbol expectedType, SyntaxNodeAnalysisContext context, Location location)
+        {
+            var expressionType = context.SemanticModel.GetTypeInfo(expression).Type;
+            
+            if (expressionType is INamedTypeSymbol namedType && namedType.IsGenericType)
+            {
+                var originalDefinition = namedType.OriginalDefinition?.ToDisplayString();
+                
+                if (originalDefinition is "System.Threading.Tasks.Task<T>" or "System.Threading.Tasks.ValueTask<T>")
+                {
+                    if (namedType.TypeArguments.Length == 1)
+                    {
+                        var taskResultType = namedType.TypeArguments[0];
+                        AnalyzeReturnExpressionType(taskResultType, expectedType, context, location);
+                        return;
+                    }
+                }
+            }
+
+            AnalyzeReturnExpression(expression, expectedType, context, location);
+        }
+
+        private void AnalyzeReturnExpression(ExpressionSyntax expression, ITypeSymbol expectedType, SyntaxNodeAnalysisContext context, Location location)
+        {
+            var expressionType = context.SemanticModel.GetTypeInfo(expression).Type;
+            AnalyzeReturnExpressionType(expressionType, expectedType, context, location);
+        }
+
+        private void AnalyzeReturnExpressionType(ITypeSymbol expressionType, ITypeSymbol expectedType, SyntaxNodeAnalysisContext context, Location location)
+        {
+            if (expressionType == null) return;
+
+            if (!IsTypeCompatible(expressionType, expectedType, context))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(
+                    Rule,
+                    location,
+                    expectedType.Name,
+                    expressionType.Name));
             }
         }
 
@@ -73,18 +130,19 @@ namespace ActionResultAnalyzer
         {
             if (SymbolEqualityComparer.Default.Equals(returnedType, expectedType))
                 return true;
-            
-            if (returnedType.IsTaskWrapper(expectedType, context))
-                return true;
-            
-            var actionResultTypeName = "Microsoft.AspNetCore.Mvc.ActionResult";
-            var actionResultTTypeName = "Microsoft.AspNetCore.Mvc.ActionResult`1";
-            
-            if (returnedType.InheritsFrom(actionResultTypeName))
+
+            var actionResultType = context.Compilation.GetTypeByMetadataName("Microsoft.AspNetCore.Mvc.ActionResult");
+            if (actionResultType != null && returnedType.InheritsFrom(actionResultType))
                 return true;
 
-            if (returnedType.IsGenericActionResult(actionResultTTypeName, expectedType))
-                return true;
+            var actionResultTType = context.Compilation.GetTypeByMetadataName("Microsoft.AspNetCore.Mvc.ActionResult`1");
+            if (actionResultTType != null && 
+                returnedType.OriginalDefinition?.Equals(actionResultTType, SymbolEqualityComparer.Default) == true &&
+                returnedType is INamedTypeSymbol namedType && 
+                namedType.TypeArguments.Length == 1)
+            {
+                return SymbolEqualityComparer.Default.Equals(namedType.TypeArguments[0], expectedType);
+            }
 
             return false;
         }
@@ -92,66 +150,15 @@ namespace ActionResultAnalyzer
 
     public static class SymbolExtensions
     {
-        public static bool InheritsFrom(this ITypeSymbol type, string fullTypeName)
+        public static bool InheritsFrom(this ITypeSymbol type, ITypeSymbol possibleBaseType)
         {
             var current = type;
-            while (current is not null)
+            while (current != null)
             {
-                if (current.ToDisplayString() == fullTypeName)
+                if (current.Equals(possibleBaseType, SymbolEqualityComparer.Default))
                     return true;
                 current = current.BaseType;
             }
-            return false;
-        }
-
-        public static bool IsGenericActionResult(this ITypeSymbol type, string actionResultTTypeName, ITypeSymbol expectedType)
-        {
-            if (type is not INamedTypeSymbol namedType || !namedType.IsGenericType)
-                return false;
-
-            var originalDefinition = namedType.OriginalDefinition;
-            if (originalDefinition.ToDisplayString() != actionResultTTypeName)
-                return false;
-
-            return namedType.TypeArguments.Length == 1 && 
-                   SymbolEqualityComparer.Default.Equals(namedType.TypeArguments[0], expectedType);
-        }
-
-        public static bool IsTaskWrapper(this ITypeSymbol type, ITypeSymbol expectedType, SyntaxNodeAnalysisContext context)
-        {
-            if (type is INamedTypeSymbol namedType && namedType.IsGenericType)
-            {
-                var originalDefinition = namedType.OriginalDefinition;
-                var originalDefinitionName = originalDefinition.ToDisplayString();
-                
-                if (originalDefinitionName is "System.Threading.Tasks.Task<T>" or "System.Threading.Tasks.ValueTask<T>")
-                {
-                    if (namedType.TypeArguments.Length == 1)
-                    {
-                        var taskResultType = namedType.TypeArguments[0];
-                        
-                        return IsTypeCompatible(taskResultType, expectedType, context);
-                    }
-                }
-            }
-            
-            return false;
-        }
-
-        private static bool IsTypeCompatible(ITypeSymbol returnedType, ITypeSymbol expectedType, SyntaxNodeAnalysisContext context)
-        {
-            var actionResultTypeName = "Microsoft.AspNetCore.Mvc.ActionResult";
-            var actionResultTTypeName = "Microsoft.AspNetCore.Mvc.ActionResult`1";
-            
-            if (SymbolEqualityComparer.Default.Equals(returnedType, expectedType))
-                return true;
-
-            if (returnedType.InheritsFrom(actionResultTypeName))
-                return true;
-
-            if (returnedType.IsGenericActionResult(actionResultTTypeName, expectedType))
-                return true;
-
             return false;
         }
     }
